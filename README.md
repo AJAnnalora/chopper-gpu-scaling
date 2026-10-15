@@ -1,8 +1,9 @@
 # Multi-GPU device policy — test code
 
-This repository holds the part of a protein-design pipeline that decides how many GPUs a run
-may use, how the work is split across them, and what command line that produces. It is one
-module and its tests. The pipeline itself is not here and is not public.
+This repository holds the parts of a protein-design pipeline that decide how the hardware gets
+used: how many GPUs a run may use, how the work is split across them, what command line that
+produces, and how jobs take turns on a machine so they never collide. Two modules and their
+tests. The pipeline itself is not here and is not public.
 
 It exists because a compute-allocation request should be checkable. Below is how to check it
 in under a minute, on any machine, **with no GPU and nothing to install.**
@@ -26,13 +27,14 @@ Requires Python 3 and nothing else — no `pip install`, no GPU, no network.
 python3 selftest.py
 ```
 
-Twenty-six assertions. They simulate both a 1-GPU box and an 8-GPU box and check the
-behavior that actually matters when an allocation is on the line.
+Both modules' suites, around fifty assertions. They simulate a 1-GPU box and an 8-GPU box,
+and they simulate crashed and competing jobs, checking the behavior that actually matters when
+an allocation is on the line.
 
 Then see a multi-GPU run resolved on whatever machine you are sitting at:
 
 ```bash
-python3 gpu_devices.py --plan example_8gpu.loadfile.txt
+python3 scripts/gpu_devices.py --plan example_8gpu.loadfile.txt
 ```
 
 On a single-GPU machine that prints:
@@ -47,7 +49,7 @@ On a single-GPU machine that prints:
 And what this machine reports for itself:
 
 ```bash
-python3 gpu_devices.py --show
+python3 scripts/gpu_devices.py --show
 ```
 
 ## The four decisions worth checking
@@ -78,6 +80,48 @@ a split mode works:
 AlphaFold-2 is `UNSUPPORTED` on purpose. Its multi-GPU story is not device sharding, and a
 flag that merely parses is not support. If AF-2 sharding is wanted later it earns its own
 status rather than inheriting one.
+
+## Taking turns on the hardware
+
+Deciding how many devices a run may use is half the problem. The other half is making sure two
+runs never try to use the same ones, and that a crashed run does not leave the machine idle.
+`scripts/chopper_launch.py` is that half:
+
+```bash
+python3 scripts/chopper_launch.py --status      # what is running, waiting, finished
+python3 scripts/chopper_launch.py --selftest    # the tests described below
+```
+
+**One job at a time, and it is a lock rather than a promise.** The lockfile is created with
+`O_EXCL`, so two launches racing cannot both win — one takes it, the other is refused and told
+what is already running. A policy written in a comment gets forgotten; a policy enforced by the
+filesystem does not.
+
+**A crashed job does not wedge the queue.** The lock holds the process id of whatever took it.
+If that process is gone, the lock is detected as stale by asking the operating system — and
+distinguishing a dead process from a zombie, which `kill(pid, 0)` alone does not do — then
+cleared, and the interrupted job is recorded as interrupted rather than quietly forgotten.
+
+**The queue keeps the hardware busy unattended.** Jobs can be queued with priorities, the same
+job cannot be queued twice, a job already running will not be queued again, and asking the
+queue to start something while a job is running is refused rather than allowed to overlap.
+
+Those are the properties the test suite asserts, including the cases that are awkward to
+produce by hand: a dead job's lock, a lock inherited after a crash, a pump attempted while
+busy, and a queue surviving all of it.
+
+### Why this belongs in a compute-allocation discussion
+
+The failure it prevents is not exotic. A shared machine, two runs started a minute apart, both
+grabbing the same devices, both finishing slower than either would alone, and no record
+afterwards of which pose came from which. Or the quieter version: a job dies at 2am and the
+hardware sits idle until someone notices. Neither is a modeling problem, and both waste the
+thing being allocated.
+
+Two of the test names in here are the scars of that: a job already running is not queued again,
+and an interrupted job is recorded rather than forgotten.
+
+---
 
 ## Two modes, and only one of them works today
 
@@ -135,15 +179,16 @@ whether the near-linear expectation above survives contact with a real node.
 ## Files
 
 ```
-gpu_devices.py              the whole device-policy surface: @GPU parsing, the capability
+scripts/gpu_devices.py      the whole device-policy surface: @GPU parsing, the capability
                             map, resolution, the plan/execute gate, and the engine argv
+scripts/chopper_launch.py   the job lock and queue: one job at a time, enforced
 example_8gpu.loadfile.txt   a declaration asking for 8 devices. Device policy only --
                             no target, no sequences
 selftest.py                 runs every test in the repository
 LICENSE                     no license granted; shared for review
 ```
 
-`gpu_devices.py` imports only the Python standard library — no array or tensor libraries, no
+Both modules import only the Python standard library — no array or tensor libraries, no
 pipeline modules. That is deliberate: the gate has to fail in a second rather than forty
 minutes into a fold with a model stack loaded, and it means anyone can run these tests.
 

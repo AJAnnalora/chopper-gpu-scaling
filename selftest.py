@@ -8,8 +8,20 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+CHECKS = ["scripts/gpu_devices.py", "scripts/chopper_launch.py"]
 
-rc = subprocess.run([sys.executable, str(ROOT / "gpu_devices.py"), "--selftest"]).returncode
-print()
-print("PASS" if rc == 0 else "FAIL")
-raise SystemExit(rc)
+passed, failed = [], []
+for rel in CHECKS:
+    print("=" * 72)
+    print(rel)
+    print("=" * 72)
+    rc = subprocess.run([sys.executable, str(ROOT / rel), "--selftest"]).returncode
+    (passed if rc == 0 else failed).append(rel)
+    print()
+
+print("-" * 72)
+print("%d passed, %d failed" % (len(passed), len(failed)))
+for rel in failed:
+    print("  FAILED  " + rel)
+print("PASS" if not failed else "FAIL")
+raise SystemExit(1 if failed else 0)
