@@ -227,7 +227,13 @@ def allocated_gpu_count(physical=None):
         if not ok:
             break              # truncate at the first token that is not a real device
         if part in accepted:
-            return 0           # a duplicate rejects the whole list, not just the remainder
+            # A duplicate rejects the whole list, not just the remainder. This is MEASURED
+            # behaviour, not a cautious choice: CUDA_VISIBLE_DEVICES=0,0 makes
+            # torch.cuda.device_count() report 0 on real hardware. Returning 1 here -- on the
+            # reasonable-sounding grounds that one real card was merely named twice -- would
+            # over-report by a device and reintroduce the bug this function exists to close.
+            # Do not "fix" it without re-measuring; the assertion in selftest() is the record.
+            return 0
         accepted.append(part)
 
     # Index and UUID forms do not mix: once the list is one kind, a token of the other kind
