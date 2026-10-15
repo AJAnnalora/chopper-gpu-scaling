@@ -8,6 +8,11 @@ tests. The pipeline itself is not here and is not public.
 It exists because a compute-allocation request should be checkable. Below is how to check it
 in under a minute, on any machine, **with no GPU and nothing to install.**
 
+**You may read it and run it; you may not reuse it.** That is deliberate and it is what
+`LICENSE` says — the copyright position on this code is not settled yet, so no rights are
+granted. Reading and running is all that reviewing requires, and it is explicitly permitted.
+If you want to use any of it, ask.
+
 ## The honest status, first
 
 **Nothing in this repository has ever executed on more than one device.** This laboratory has
@@ -104,10 +109,18 @@ That keeps network variance out of a timing measurement and keeps the sequences 
 rather than assembled separately here. If the policy and the benchmark could disagree, the
 benchmark would be measuring something other than what a run does.
 
-**What it measures:** independent folds sharded across devices, the task-parallel case, which
-is most of a real campaign. **What it does not:** context-parallel folding of one oversized
-complex, which no installed engine supports. It also folds single chains rather than two-chain
-complexes, so read it as a measurement of the sharding rather than of our campaign throughput.
+### What this does not measure
+
+Stated as its own heading because it is the sentence that keeps the rest honest, and a caveat
+buried mid-paragraph is a caveat nobody reads.
+
+**It measures sharding, not campaign throughput.** Two reasons. It folds *single chains*,
+where a real campaign folds two-chain complexes, which are larger and slower per fold. And it
+measures the task-parallel case only — independent folds spread across devices. It says nothing
+about context-parallel folding of one oversized complex, which no installed engine supports
+(see above).
+
+So a good number here means the sharding works. It does not mean a campaign runs this fast.
 
 If efficiency falls below roughly 60% at 8 devices, per-device fixed costs — model load, input
 parsing — are dominating, and the answer is a larger batch rather than more cards. That is the
