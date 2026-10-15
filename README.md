@@ -4,8 +4,10 @@
 
 This repository holds the parts of a protein-design pipeline that decide how the hardware gets
 used: how many GPUs a run may use, how the work is split across them, what command line that
-produces, and how jobs take turns on a machine so they never collide. Two modules and their
-tests. The pipeline itself is not here and is not public.
+produces, and how jobs take turns on a machine so they never collide. Three modules and their
+tests, a benchmark that measures real speedup, batch scripts for a cluster, and the numbers
+measured so far on the one card available here. The pipeline itself is not here and is not
+public.
 
 It exists because a compute-allocation request should be checkable. Below is how to check it
 in under a minute, on any machine, **with no GPU and nothing to install.**
@@ -34,14 +36,14 @@ Requires Python 3 and nothing else — no `pip install`, no GPU, no network.
 python3 selftest.py
 ```
 
-Both modules' suites. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
+Three suites, 57 assertions. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
 allocation, and they simulate crashed and competing jobs, checking the behavior that actually
 matters when an allocation is on the line.
 
 The same suite runs on every push to this repository, on Python 3.10, 3.12 and 3.13, on a
 clean machine with **no GPU at all** — see `.github/workflows/selftest.yml`. There is no
-install step in it, which is the point: if a dependency ever creeps in, the badge above turns
-red and the "nothing to install" claim stops being a promise and starts being enforced.
+install step in it, which is the point: if a dependency ever creeps in that workflow fails,
+and the "nothing to install" claim above stops being a promise and starts being enforced.
 
 Then see a multi-GPU run resolved on whatever machine you are sitting at:
 
