@@ -1,6 +1,6 @@
 # Multi-GPU device policy — test code
 
-
+[![selftest](https://github.com/AJAnnalora/chopper-gpu-scaling/actions/workflows/selftest.yml/badge.svg)](https://github.com/AJAnnalora/chopper-gpu-scaling/actions/workflows/selftest.yml)
 
 This repository holds the parts of a protein-design pipeline that decide how the hardware gets
 used: how many GPUs a run may use, how the work is split across them, what command line that
