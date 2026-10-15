@@ -81,6 +81,40 @@ AlphaFold-2 is `UNSUPPORTED` on purpose. Its multi-GPU story is not device shard
 flag that merely parses is not support. If AF-2 sharding is wanted later it earns its own
 status rather than inheriting one.
 
+## Measure it yourself
+
+The honest limit of everything above is that it was written on one GPU. So rather than claim a
+scaling factor, this repository ships the thing that measures one:
+
+```bash
+python3 scripts/scaling_benchmark.py --dry-run          # what it would run. No GPU, no install
+python3 scripts/scaling_benchmark.py --devices 1,2,4,8 --copies 16
+```
+
+The real run needs [Boltz](https://github.com/jwohlwend/boltz) — the open folding engine this
+pipeline drives — and that many visible GPUs. It folds 16 independent copies of a public
+sequence (GFP, UniProt P42212, one substitution apart so none is a cache hit), shards them
+across the devices, and prints wall-clock, speedup against the single-device run, and parallel
+efficiency. Results are written to `scaling.json`.
+
+It is **offline**: the inputs declare an empty alignment, so nothing is sent to an MSA server.
+That keeps network variance out of a timing measurement and keeps the sequences on the machine.
+
+**The device arguments are built by `scripts/gpu_devices.py`** — the module the tests cover —
+rather than assembled separately here. If the policy and the benchmark could disagree, the
+benchmark would be measuring something other than what a run does.
+
+**What it measures:** independent folds sharded across devices, the task-parallel case, which
+is most of a real campaign. **What it does not:** context-parallel folding of one oversized
+complex, which no installed engine supports. It also folds single chains rather than two-chain
+complexes, so read it as a measurement of the sharding rather than of our campaign throughput.
+
+If efficiency falls below roughly 60% at 8 devices, per-device fixed costs — model load, input
+parsing — are dominating, and the answer is a larger batch rather than more cards. That is the
+number we would most like to know and cannot currently produce.
+
+---
+
 ## Taking turns on the hardware
 
 Deciding how many devices a run may use is half the problem. The other half is making sure two
@@ -182,6 +216,7 @@ whether the near-linear expectation above survives contact with a real node.
 scripts/gpu_devices.py      the whole device-policy surface: @GPU parsing, the capability
                             map, resolution, the plan/execute gate, and the engine argv
 scripts/chopper_launch.py   the job lock and queue: one job at a time, enforced
+scripts/scaling_benchmark.py  measure real speedup across N GPUs. --dry-run needs neither
 example_8gpu.loadfile.txt   a declaration asking for 8 devices. Device policy only --
                             no target, no sequences
 selftest.py                 runs every test in the repository
