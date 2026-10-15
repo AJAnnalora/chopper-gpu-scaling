@@ -1,0 +1,22 @@
+MULTI-GPU DEVICE POLICY -- DEMONSTRATION AND TEST CODE
+Copyright (c) 2026 Oregon State University. All rights reserved.
+
+NO LICENSE IS GRANTED. This repository is shared for EVALUATION AND REVIEW ONLY.
+
+You may read this code, run it, and form a judgment about it. You may not
+redistribute it, publish it, or use it or any derivative of it for any other
+purpose without written permission from the copyright holder.
+
+The absence of an open-source license is deliberate rather than an oversight.
+This code is part of an active research program; the copyright position and the
+licensing position have not been settled, and granting rights now -- in
+particular granting patent rights -- would foreclose decisions that are not the
+authors' alone to make. An open release is intended once that is resolved. Until
+then "all rights reserved" is the honest statement of where this stands, and it
+is stated here, at the filename a reader looks for, rather than left to the
+default that applies when a repository carries no license file at all.
+
+This repository vendors nothing and imports nothing beyond the Python standard
+library, so there are no third-party licenses to enumerate. The fold engine whose
+command line this code constructs is a separate program, not included here, and
+carries its own terms from its own distributor.

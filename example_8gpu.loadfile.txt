@@ -1,0 +1,26 @@
+# Device policy, on its own.
+#
+# This file declares ONLY how many GPUs a run may use and how the work is split. It carries
+# no target, no sequences and no epitopes, because none of that is needed to show the device
+# path and none of it is ours to publish. In the real pipeline the same directive sits in a
+# loadfile alongside the scientific declaration.
+#
+#   python3 gpu_devices.py --plan example_8gpu.loadfile.txt
+#
+# Run that anywhere, with or without a GPU. It prints what was requested, what is visible on
+# this machine, what would actually be used, and the fold-engine command line for both.
+#
+# THE 8 IS AN EXAMPLE, NOT A CEILING OR A REQUEST. devices=N takes any N: nothing in
+# gpu_devices.py caps it, and a request larger than the visible count resolves honestly
+# rather than being clamped silently. Eight is used here only because it is a plausible
+# node. What the parameter should actually be set to is a property of whatever hardware is
+# allocated, which is not ours to assume.
+#
+# split=batch   shard an independent candidate list across devices. Nothing is exchanged
+#               between them. This is what is live and tested here.
+# split=context shard ONE model across tightly coupled devices, for a complex too large for
+#               a single card's memory. Declarable, and UNSUPPORTED by both engines this
+#               pipeline currently drives -- see the capability map in gpu_devices.py and the
+#               README section "The mode that is not supported yet".
+
+@GPU  devices=8  split=batch  workers=4
