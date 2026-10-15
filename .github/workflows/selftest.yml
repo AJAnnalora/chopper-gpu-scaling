@@ -78,24 +78,55 @@ jobs:
             echo "OK: refused, as it must be"
           fi
 
-      # The scheduler case, which is what a cluster actually does to you: SLURM grants a
+      # The scheduler case, which is what a cluster actually does to you: Slurm grants a
       # SUBSET of a node's cards and says so in CUDA_VISIBLE_DEVICES. Asserted here because it
       # cannot be reproduced on a single-GPU workstation -- a one-card box has no subset to be
       # given -- and because getting it wrong means reaching for another job's hardware.
+      #
+      # The eight-card node is injected rather than detected: this runner has no GPU, so the
+      # real physical_gpus() returns None and the module would correctly answer "cannot
+      # validate". That is itself asserted, last.
       - name: a partial scheduler allocation is respected, not the node's inventory
         run: |
-          CUDA_VISIBLE_DEVICES=3,5 python3 - <<'PY'
-          import sys
+          python3 - <<'PY'
+          import os, sys
           sys.path.insert(0, "scripts")
           import gpu_devices as gd
-          n = gd.visible_gpu_count()
-          assert n == 2, "expected 2 allocated devices, got %r" % n
+
+          EIGHT = (8, {"GPU-%d" % i for i in range(8)})
+
+          def alloc(v):
+              os.environ["CUDA_VISIBLE_DEVICES"] = v
+              return gd.allocated_gpu_count(physical=EIGHT)
+
+          # Every expectation here was verified against torch.cuda.device_count() on real
+          # hardware. Counting commas gets the last three wrong.
+          cases = {"3,5": 2, "3,99": 1, "99,3": 0, "3,wat": 1, "3,": 1, "03": 1,
+                   "  3 , 5 ": 2, "": 0, "-1": 0, "GPU-1,GPU-2": 2, "GPU-nope": 0,
+                   "3,GPU-1": 1,
+                   # A duplicate rejects the WHOLE list: 0, not 2 and not 1.
+                   "3,3": 0, " 3 ,  3 ": 0, "3,3,3": 0, "GPU-1,GPU-1": 0}
+          for v, want in sorted(cases.items()):
+              got = alloc(v)
+              assert got == want, "CUDA_VISIBLE_DEVICES=%r -> %r, expected %r" % (v, got, want)
+              print("ok  %-12r -> %s" % (v, got))
+
+          # Granted 2, asking for 8: refused, naming both numbers.
+          os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
           try:
-              gd.validate_gpu_request("boltz", 8, "batch", visible=n)
-          except SystemExit:
-              print("OK: asked for 8 while granted 2 -> refused")
+              gd.validate_gpu_request("boltz", 8, "batch", visible=2)
+          except SystemExit as e:
+              assert "scheduler" in str(e), str(e)
+              print("ok  asked for 8 while granted 2 -> refused, blaming the scheduler")
           else:
               raise AssertionError("asked for 8 while granted 2 and it was ALLOWED")
-          gd.validate_gpu_request("boltz", 2, "batch", visible=n)
-          print("OK: asked for the 2 that were granted -> allowed")
+          gd.validate_gpu_request("boltz", 2, "batch", visible=2)
+          print("ok  asked for the 2 that were granted -> allowed")
+
+          # And on this runner for real: no GPU to enumerate, so an allocation cannot be
+          # validated and the answer is "undetermined" rather than a guess.
+          assert gd.physical_gpus() is None, "this runner was not supposed to have a GPU"
+          assert gd.allocated_gpu_count() is None
+          assert gd.visible_gpu_count() is None
+          print("ok  unverifiable allocation -> undetermined, not guessed")
           PY

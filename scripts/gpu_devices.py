@@ -108,8 +108,61 @@ def parse_gpu_directive(text):
 
 
 # ====================== DETECT ======================
-def allocated_gpu_count():
+def physical_gpus():
+    """(count, {uuids}) for the cards in this box, or None if that cannot be established.
+
+    Separate from visible_gpu_count() because CUDA_VISIBLE_DEVICES cannot be validated without
+    it: "is index 9 a real device" and "is this UUID one of ours" are questions only the
+    hardware can answer, and a token that is not a real device changes how CUDA reads the rest
+    of the list. One nvidia-smi call answers both.
+    """
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    uuids = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+    return len(uuids), uuids
+
+
+def allocated_gpu_count(physical=None):
     """GPUs THIS PROCESS may use, from the scheduler's own variable. None if it is unset.
+
+    ALSO None when the variable is set but cannot be validated, because the only honest
+    answer then is "I do not know" -- see the note on the rules below.
+
+    THE RULES ARE CUDA'S, AND THEY ARE NOT "COUNT THE COMMAS". Verified against
+    torch.cuda.device_count() on this box rather than read off the documentation, because the
+    documented rule covers only the first of these:
+
+        CUDA_VISIBLE_DEVICES    devices CUDA actually exposes
+        0                       1
+        0,9                     1    index 9 is not a device -> the list TRUNCATES there
+        9                       0    truncated at the first token, so nothing survives
+        1,0                     0    same, on a one-card box: index 1 is already invalid
+        abc,0                   0    any unparsable token truncates
+        0,abc                   1
+        0,                      1    trailing and empty tokens are ignored
+        00                      1    parsed as an integer, so leading zeros are fine
+        0,0                     0    a DUPLICATE rejects the WHOLE list. Not a truncation
+        0,<uuid of device 0>    1    index and UUID forms do not mix; the second truncates
+        <uuid>                  1    a real UUID resolves
+        GPU-nonsense            0
+        -1                      0    the documented idiom for "no devices"
+
+    The duplicate case is the one that makes counting tokens actively dangerous rather than
+    merely imprecise. `0,0` LOOKS like two devices and is zero, so a stale or hand-edited
+    allocation string would have opened the gate on a number the job does not own -- the exact
+    class of failure the scheduler fix was written to close, reintroduced one layer down.
+
+    Returning None when the variable is set but the hardware cannot be enumerated is
+    deliberate. Without the physical device list, "is index 9 valid" is unanswerable, so the
+    count is a guess; this module's standing rule is to refuse rather than guess, and
+    multi-device EXECUTION is what gets refused. Planning still resolves anywhere.
 
     WHY THIS EXISTS, AND WHY IT COMES FIRST. nvidia-smi reports the GPUs PHYSICALLY IN THE
     BOX. On a shared cluster node those are not the GPUs you were given. SLURM hands you a
@@ -134,14 +187,44 @@ def allocated_gpu_count():
     raw = raw.strip()
     if raw == "":
         return 0
-    n = 0
+
+    if physical is None:
+        physical = physical_gpus()
+    if physical is None:
+        return None            # set, but unverifiable. Refuse rather than guess.
+    count, uuids = physical
+
+    # MIG instances are addressed by MIG-<uuid>, which --query-gpu=uuid does not list, so this
+    # cannot confirm them. Guessing would be the same mistake in a smaller font.
+    if any(p.strip().startswith("MIG-") for p in raw.split(",")):
+        return None
+
+    accepted = []
     for part in raw.split(","):
         part = part.strip()
-        if part.isdigit() or part.startswith("GPU-") or part.startswith("MIG-"):
-            n += 1
+        if part == "":
+            break              # trailing or empty token: the list ends here
+        if part.isdigit():
+            ok = int(part) < count
+        elif part.startswith("GPU-"):
+            ok = part in uuids
         else:
-            break          # CUDA stops at the first invalid entry; so do we.
-    return n
+            ok = False         # "-1", "abc", anything else
+        if not ok:
+            break              # truncate at the first token that is not a real device
+        if part in accepted:
+            return 0           # a duplicate rejects the whole list, not just the remainder
+        accepted.append(part)
+
+    # Index and UUID forms do not mix: once the list is one kind, a token of the other kind
+    # truncates it. Enforced here rather than in the loop so the duplicate rule still sees the
+    # full prefix it needs.
+    if accepted:
+        kind = accepted[0].isdigit()
+        for i, part in enumerate(accepted):
+            if part.isdigit() != kind:
+                return i
+    return len(accepted)
 
 
 def visible_gpu_count():
@@ -155,9 +238,12 @@ def visible_gpu_count():
     the one being asked -- see allocated_gpu_count(), which is consulted first precisely
     because on a shared node the two answers differ and only one of them is ours to use.
     """
-    allocated = allocated_gpu_count()
-    if allocated is not None:
-        return allocated
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+        # Set, so it governs -- including when it resolves to 0, and including when it cannot
+        # be validated and the answer is None. Falling back to the box's inventory here would
+        # reinstate the original bug: an unverifiable allocation would be silently replaced by
+        # a number the job may not own.
+        return allocated_gpu_count()
     if not shutil.which("nvidia-smi"):
         return None
     try:
@@ -224,7 +310,11 @@ def validate_gpu_request(engine, devices, split, *, visible=None, executing=True
             # eight cards in it until you know the scheduler is being quoted, and that is
             # exactly the case where the message has to be self-explanatory -- the reader is
             # looking at a failed cluster job and `nvidia-smi` saying eight.
-            if allocated_gpu_count() is not None:
+            # Discriminate on whether the variable is SET, not on whether it could be
+            # validated. Asking allocated_gpu_count() again re-derives what the caller has
+            # already settled, and gets it wrong wherever the allocation is unverifiable --
+            # blaming nvidia-smi for a number that came from the scheduler.
+            if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
                 src = ("allocated to this job by the scheduler; CUDA_VISIBLE_DEVICES=%s"
                        % os.environ.get("CUDA_VISIBLE_DEVICES", ""))
                 how = ("Ask the scheduler for %d (e.g. --gres=gpu:%d), or lower devices to "
@@ -376,40 +466,112 @@ def selftest():
     ck("af2 at devices=1 still passes -- today's path is untouched",
        validate_gpu_request("af2", 1, "batch", visible=1) is None)
 
-    # The scheduler's allocation, not the box's inventory. These are the cluster cases, and
-    # they are the ones a single-GPU workstation can never produce by accident: nvidia-smi is
-    # right about the hardware and wrong about what this job was given.
+    # ================== THE SCHEDULER'S ALLOCATION ==================
+    # These are the cluster cases: nvidia-smi is right about the hardware and wrong about what
+    # this job was given. A single-GPU workstation cannot produce them by accident, so an
+    # eight-card node is simulated by passing `physical` rather than by trusting this box.
+    #
+    # EVERY EXPECTED VALUE BELOW WAS VERIFIED AGAINST torch.cuda.device_count() on real
+    # hardware before being written down. They are not read off NVIDIA's documentation, which
+    # describes the truncation rule and says nothing about duplicates -- and duplicates turn
+    # out to be the dangerous case.
+    EIGHT = (8, {"GPU-%d" % i for i in range(8)})
     _saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    def alloc(value):
+        os.environ["CUDA_VISIBLE_DEVICES"] = value
+        return allocated_gpu_count(physical=EIGHT)
+
     try:
+        ck("a 2-GPU allocation on an 8-GPU node reports 2, not 8", alloc("3,5") == 2)
+        ck("...and devices=2, which is what was granted, passes",
+           validate_gpu_request("boltz", 2, "batch", visible=alloc("3,5")) is None)
+        ck("...while devices=8 in that allocation is REFUSED rather than stealing cards",
+           refuses(lambda: validate_gpu_request("boltz", 8, "batch", visible=alloc("3,5"))))
         os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
-        ck("a 2-GPU SLURM allocation on an 8-GPU node reports 2, not 8",
-           visible_gpu_count() == 2)
-        ck("...so devices=8 in that allocation is REFUSED rather than stealing cards",
-           refuses(lambda: validate_gpu_request("boltz", 8, "batch",
-                                                visible=visible_gpu_count())))
         try:
-            validate_gpu_request("boltz", 8, "batch", visible=visible_gpu_count())
+            validate_gpu_request("boltz", 8, "batch", visible=2)
             msg = ""
         except SystemExit as e:
             msg = str(e)
         # The refusal has to say WHERE the count came from, or it reads as nonsense next to an
-        # nvidia-smi that is reporting eight cards on the same node.
+        # nvidia-smi reporting eight cards on the same node.
         ck("...and the refusal blames the scheduler, not nvidia-smi",
            "scheduler" in msg and "CUDA_VISIBLE_DEVICES=3,5" in msg and "nvidia-smi" not in msg)
-        ck("...and says how to fix it from the submission side",
-           "--gres=gpu:8" in msg)
-        ck("...and devices=2, which is what was actually granted, passes",
-           validate_gpu_request("boltz", 2, "batch", visible=visible_gpu_count()) is None)
-        os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-aaaa1111,GPU-bbbb2222,GPU-cccc3333"
-        ck("a UUID allocation is counted, not mistaken for zero", visible_gpu_count() == 3)
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        ck("...and says how to fix it from the submission side", "--gres=gpu:8" in msg)
+
+        # Tokens are not devices. Counting commas gets every one of these wrong.
+        ck("an out-of-range index TRUNCATES the list, as it does for CUDA",
+           alloc("3,99") == 1)
+        ck("...and an out-of-range index FIRST leaves nothing", alloc("99,3") == 0)
+        ck("an unparsable token truncates", alloc("3,wat") == 1)
+        ck("...and truncates from the front too", alloc("wat,3") == 0)
+        ck("a trailing comma is not a device", alloc("3,") == 1)
+        ck("leading zeros still parse as an index", alloc("03") == 1)
+        ck("surrounding whitespace is tolerated", alloc("  3 , 5 ") == 2)
+
+        # THE DANGEROUS ONE. `0,0` looks like two devices and CUDA exposes NONE: a duplicate
+        # rejects the whole list rather than truncating it. Counting tokens would have
+        # answered 2 and opened the gate on a card the job does not own twice over -- the same
+        # failure class as reading nvidia-smi instead of the allocation, one layer down.
+        ck("a DUPLICATE index rejects the whole list, which is 0 and not 1", alloc("3,3") == 0)
+        ck("...including with whitespace between them", alloc(" 3 ,  3 ") == 0)
+        ck("...and three of them", alloc("3,3,3") == 0)
+        ck("...and duplicate UUIDs likewise", alloc("GPU-1,GPU-1") == 0)
+
+        ck("a UUID allocation resolves against the real UUIDs", alloc("GPU-1,GPU-2") == 2)
+        ck("an unknown UUID is not a device", alloc("GPU-nope") == 0)
+        ck("index and UUID forms do not mix; the odd one out truncates",
+           alloc("3,GPU-1") == 1)
         ck("an empty allocation is 0 -- a deliberate zero, distinct from undetermined",
-           visible_gpu_count() == 0)
+           alloc("") == 0)
+        ck("the CUDA disable idiom -1 yields 0 usable devices", alloc("-1") == 0)
+
+        ck("MIG instances, which cannot be confirmed, are undetermined rather than guessed",
+           alloc("MIG-abc,MIG-def") is None)
+
+        # Unverifiable is not the same as unset, and must not fall back to the inventory.
+        # physical_gpus() is stubbed out because "nvidia-smi is missing" cannot be arranged
+        # any other way on a box that has it, and asserting this only where it happens to be
+        # absent would be a test that silently never runs.
+        _real_physical = globals()["physical_gpus"]
+        try:
+            globals()["physical_gpus"] = lambda: None
+            os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
+            ck("an allocation that cannot be validated is None -- refuse rather than guess",
+               allocated_gpu_count() is None)
+            ck("...and visible_gpu_count does NOT fall back to the box's inventory there",
+               visible_gpu_count() is None)
+            ck("...though an explicitly empty allocation still means 0, not unknown",
+               (os.environ.__setitem__("CUDA_VISIBLE_DEVICES", ""),
+                allocated_gpu_count())[1] == 0)
+            # The refusal must still credit the scheduler here. It decides that from whether
+            # the variable is SET, not from whether the count could be validated -- asking
+            # again would re-derive what the caller already settled and get it backwards in
+            # exactly this case.
+            os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
+            try:
+                validate_gpu_request("boltz", 8, "batch", visible=2)
+                m2 = ""
+            except SystemExit as e:
+                m2 = str(e)
+            ck("...and an unverifiable allocation STILL blames the scheduler, not nvidia-smi",
+               "scheduler" in m2 and "nvidia-smi" not in m2)
+        finally:
+            globals()["physical_gpus"] = _real_physical
+
+        # An allocation of zero is a real answer and must survive, or a job granted nothing
+        # would quietly run on the whole box.
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-        ck("the CUDA disable idiom -1 yields 0 usable devices", visible_gpu_count() == 0)
+        ck("an allocation of 0 is NOT replaced by the box's inventory",
+           visible_gpu_count() == 0)
+        ck("...and a multi-device request against it is refused",
+           refuses(lambda: validate_gpu_request("boltz", 2, "batch",
+                                                visible=visible_gpu_count())))
+
         del os.environ["CUDA_VISIBLE_DEVICES"]
         ck("unset falls back to the box's own count, which is how a workstation behaves",
-           visible_gpu_count() == allocated_gpu_count() or allocated_gpu_count() is None)
+           allocated_gpu_count() is None)
     finally:
         if _saved is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -479,8 +641,29 @@ def main():
         sys.exit(selftest())
 
     if a.show:
+        # Print the two numbers separately and say which governs. The old single line was
+        # labelled "nvidia-smi visible GPUs" whatever the source, so under an allocation it
+        # reported the allocation and credited nvidia-smi -- "nvidia-smi visible GPUs: 2" on a
+        # node where nvidia-smi says 8. That is the baffling message the refusal text was
+        # fixed to avoid, still being printed one command over.
         n = visible_gpu_count()
-        print("nvidia-smi visible GPUs: %s" % ("undetermined" if n is None else n))
+        phys = physical_gpus()
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        print("GPUs in this box (nvidia-smi) : %s"
+              % ("undetermined" if phys is None else phys[0]))
+        if cvd is None:
+            print("CUDA_VISIBLE_DEVICES          : <unset>  (no allocation; the box governs)")
+        else:
+            print("CUDA_VISIBLE_DEVICES          : %r" % cvd)
+        print("usable by this process        : %s%s"
+              % ("undetermined" if n is None else n,
+                 "   <- the allocation governs" if cvd is not None else ""))
+        if cvd is not None and phys is not None and n is not None and n != len(cvd.split(",")):
+            # Say so out loud: the difference between tokens and devices is the whole lesson
+            # of this variable, and a silent discrepancy here is what sent us looking.
+            print("  note: %d comma-separated token(s) resolve to %d real device(s) -- CUDA "
+                  "truncates at the first\n        entry that is not a device, and rejects "
+                  "the whole list if one repeats." % (len(cvd.split(",")), n))
         print("splits capability map:")
         for eng, caps in sorted(SPLITS.items()):
             print("  %-10s %s" % (eng, caps))

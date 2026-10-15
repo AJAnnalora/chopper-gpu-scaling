@@ -36,7 +36,7 @@ Requires Python 3 and nothing else — no `pip install`, no GPU, no network.
 python3 selftest.py
 ```
 
-Three suites, 57 assertions. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
+Three suites, 77 assertions. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
 allocation, and they simulate crashed and competing jobs, checking the behavior that actually
 matters when an allocation is on the line.
 
@@ -91,6 +91,26 @@ would pass the gate and the run would reach for six cards belonging to another j
 scheduler's variable is read first, and the hardware only when there is no allocation to
 respect. This was a real bug, found while writing the batch scripts in `slurm/`, and it is one
 a single-GPU workstation cannot surface: a one-card box has no subset to be given.
+
+**And the allocation string is parsed by CUDA's rules, not by counting commas.** Which matters
+more than it sounds, because those rules are not intuitive and only the first of them is
+documented:
+
+| `CUDA_VISIBLE_DEVICES` | devices CUDA exposes | |
+|---|---|---|
+| `0,9` | 1 | index 9 is not a device, so the list **truncates** there |
+| `9` | 0 | truncated at the first token; nothing survives |
+| `0,0` | **0** | a **duplicate rejects the whole list** — not two devices, and not one |
+| `0,abc` | 1 | any unparsable token truncates |
+| `0,<uuid of device 0>` | 1 | index and UUID forms do not mix |
+
+Every row was verified against `torch.cuda.device_count()` on real hardware rather than read
+off the documentation, which covers the truncation rule and says nothing about duplicates. The
+duplicate case is why counting tokens is dangerous rather than merely imprecise: `0,0` *looks*
+like two devices, so a stale or hand-edited allocation would have opened the gate on a count
+the job does not own — the same failure the fix above closes, one layer further down. Indices
+are checked against the real devices and UUIDs against the real UUIDs, and when the hardware
+cannot be enumerated at all the answer is "undetermined", which refuses rather than guesses.
 
 **Unsupported paths are marked unsupported.** The capability map records, per engine, whether
 a split mode works:
@@ -268,6 +288,10 @@ That one ratio decides the whole multi-GPU question here, because sharding a bat
 contention for host memory, PCIe and the filesystem, all of which push the real number down.
 They are published because they are falsifiable: run the benchmark on eight real cards and the
 table is either approximately right or it is wrong.
+
+Note which row the default lands on: no `--copies` means 16 folds per device, so 8 GPUs fold
+128 and the expected answer is **84%**, not the 91% below it. The default runs the smaller case
+on purpose, because 256 folds is a lot of GPU time to ask of someone checking a claim.
 
 The honest shape of the answer is therefore conditional, and both halves are worth stating.
 **Small panels do not justify multiple cards.** At 32 candidates, most of the gain is consumed

@@ -66,6 +66,15 @@ and prints a warning if asked for less.
 hundreds of candidates — the largest to date was 868 — which is where the fixed cost amortizes
 and predicted efficiency reaches the 90s. That is the regime the request is about.
 
+### What the default run will show you
+
+`scaling_benchmark.py` with no `--copies` uses 16 folds per device, so on 8 GPUs it folds 128
+and the table above predicts **84%** — not the 91% or 97% further down the column. Those need
+256 and 868 candidates respectively, which is more folding than a reviewer should have to do to
+check an arithmetic claim. So the default deliberately runs the smaller, less flattering case,
+and 84% is the number to expect from it. Raise `--copies` to 256 to test the 91% figure
+directly.
+
 ## A second, independent anchor
 
 From a different, larger run on the same card: a 868-candidate campaign sustained **523
