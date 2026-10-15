@@ -84,7 +84,14 @@ def parse_gpu_directive(text):
             "@GPU appears %d times; it may appear at most once per loadfile. "
             "One directive answers 'how is this run using the hardware'." % len(hits))
     req["declared"] = True
-    for key, val in _KV.findall(hits[0]):
+    # Cut the trailing comment BEFORE scanning for key=value. Without this, `#` is not a
+    # comment on the @GPU line at all: `@GPU devices=2 # split=context` silently applied
+    # split=context, and `# workers=99 was the old value` silently applied workers=99. A
+    # commented-out setting taking effect is the exact failure the rest of this module is
+    # built to prevent, so it is a parse-time cut rather than a validation-time complaint.
+    # (`# @GPU ...` at line start was already safe -- _GPU_LINE anchors @GPU to the line.)
+    spec = hits[0].split("#", 1)[0]
+    for key, val in _KV.findall(spec):
         key = key.lower()
         if key not in ("devices", "split", "workers"):
             raise SystemExit(
@@ -284,6 +291,20 @@ def selftest():
        refuses(lambda: parse_gpu_directive("@GPU gpus=4\n")))
     ck("a non-integer devices is refused",
        refuses(lambda: parse_gpu_directive("@GPU devices=lots\n")))
+
+    # A trailing comment is a comment, not configuration. Found by probing the parser rather
+    # than by reading it: every one of these used to take effect.
+    ck("a commented-out key on the @GPU line does NOT take effect",
+       parse_gpu_directive("@GPU devices=2  # split=context\n")["split"] == "batch")
+    ck("...nor does a commented-out workers value",
+       parse_gpu_directive("@GPU devices=8 split=batch  # workers=99 was the old value\n")
+       ["workers"] is None)
+    ck("the keys BEFORE the comment still apply",
+       parse_gpu_directive("@GPU devices=4  # split=context\n")["devices"] == 4)
+    ck("an unknown key inside a comment is not an error either",
+       parse_gpu_directive("@GPU devices=2  # gpus=4 was wrong\n")["devices"] == 2)
+    ck("a fully commented-out directive is not a declaration",
+       parse_gpu_directive("# @GPU devices=8\n")["declared"] is False)
 
     ck("devices=0 is refused",
        refuses(lambda: validate_gpu_request("boltz", 0, "batch", visible=8)))
