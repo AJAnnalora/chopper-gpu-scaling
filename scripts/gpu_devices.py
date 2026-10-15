@@ -188,28 +188,42 @@ def allocated_gpu_count(physical=None):
     if raw == "":
         return 0
 
-    if physical is None:
-        physical = physical_gpus()
-    if physical is None:
-        return None            # set, but unverifiable. Refuse rather than guess.
-    count, uuids = physical
+    # The hardware is consulted LAZILY, only once a token is reached that cannot be judged
+    # without it. This is not an optimisation: "-1" and "abc" are invalid by their FORM, so
+    # they expose no devices whatever hardware is present, and a machine with no GPU at all
+    # must still be able to resolve them. Demanding the device list up front made the whole
+    # self-test fail on a GPU-less box -- which is precisely the machine a reviewer uses.
+    count, uuids = None, None
+    looked_up = False
 
-    # MIG instances are addressed by MIG-<uuid>, which --query-gpu=uuid does not list, so this
-    # cannot confirm them. Guessing would be the same mistake in a smaller font.
-    if any(p.strip().startswith("MIG-") for p in raw.split(",")):
-        return None
+    def hardware():
+        nonlocal count, uuids, looked_up
+        if not looked_up:
+            looked_up = True
+            got = physical if physical is not None else physical_gpus()
+            if got is not None:
+                count, uuids = got
+        return count is not None
 
     accepted = []
     for part in raw.split(","):
         part = part.strip()
         if part == "":
             break              # trailing or empty token: the list ends here
+        if part.startswith("MIG-"):
+            # Addressed by MIG-<uuid>, which --query-gpu=uuid does not list, so this cannot
+            # confirm it. Guessing would be the same mistake in a smaller font.
+            return None
         if part.isdigit():
+            if not hardware():
+                return None    # needs the device count, and there isn't one
             ok = int(part) < count
         elif part.startswith("GPU-"):
+            if not hardware():
+                return None    # needs the real UUIDs
             ok = part in uuids
         else:
-            ok = False         # "-1", "abc", anything else
+            ok = False         # "-1", "abc", anything else: invalid by form, no lookup needed
         if not ok:
             break              # truncate at the first token that is not a real device
         if part in accepted:
@@ -542,9 +556,13 @@ def selftest():
                allocated_gpu_count() is None)
             ck("...and visible_gpu_count does NOT fall back to the box's inventory there",
                visible_gpu_count() is None)
-            ck("...though an explicitly empty allocation still means 0, not unknown",
-               (os.environ.__setitem__("CUDA_VISIBLE_DEVICES", ""),
-                allocated_gpu_count())[1] == 0)
+            # Hardware-independent answers must survive on a box with no GPU, because that
+            # is the machine a reviewer runs this on. Asking for the device list before
+            # judging a token that needs no device list made this whole suite fail there.
+            for value, want in (("", 0), ("-1", 0), ("abc", 0), ("wat,0", 0)):
+                os.environ["CUDA_VISIBLE_DEVICES"] = value
+                ck("...while %r resolves to %d with no hardware to consult"
+                   % (value, want), allocated_gpu_count() == want)
             # The refusal must still credit the scheduler here. It decides that from whether
             # the variable is SET, not from whether the count could be validated -- asking
             # again would re-derive what the caller already settled and get it backwards in

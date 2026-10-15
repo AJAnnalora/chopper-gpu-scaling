@@ -36,7 +36,7 @@ Requires Python 3 and nothing else — no `pip install`, no GPU, no network.
 python3 selftest.py
 ```
 
-Three suites, 77 assertions. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
+Three suites, 80 assertions. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
 allocation, and they simulate crashed and competing jobs, checking the behavior that actually
 matters when an allocation is on the line.
 
