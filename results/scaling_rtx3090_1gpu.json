@@ -1,0 +1,14 @@
+{
+  "copies": 4,
+  "samples": 1,
+  "visible_gpus": 1,
+  "rows": [
+    {
+      "devices": 1,
+      "seconds": 64.3,
+      "ok": true,
+      "speedup": 1.0,
+      "efficiency": 1.0
+    }
+  ]
+}

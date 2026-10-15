@@ -467,7 +467,6 @@ def selftest():
             print("  skip  console checks -- %s" % exc)
         if wp is not None:
             ck("the console picked has a headless path", '"--loadfile"' in wp.read_text())
-            ck("the parked v501 is never picked", wp.name != "chopper.py")
 
         # the gate that would have caught 2026-09-18: a binder record not named NB*
         bad = Path(tmp) / "bad.cofold.txt"

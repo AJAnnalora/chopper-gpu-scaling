@@ -1,0 +1,35 @@
+{
+  "what": "Wall-clock for a batch of K independent folds on ONE GPU. Four batch sizes, same machine, same engine, same inputs as scripts/scaling_benchmark.py writes.",
+  "why": "It isolates the per-run fixed cost from the per-fold cost. Batch sharding across N devices makes every device pay the fixed cost separately, so that split is what decides whether adding cards helps.",
+  "hardware": "1x NVIDIA GeForce RTX 3090, 24 GB. The only GPU available to this project.",
+  "engine": "Boltz-2, local weights, --accelerator gpu --devices 1 --diffusion_samples 1",
+  "inputs": "K copies of GFP (UniProt P42212), one substitution apart so no fold is a cache hit. Single chains. Empty MSA declared in the FASTA header, so no network.",
+  "date": "2026-10-15",
+  "rows": [
+    {"copies": 1, "seconds": 34.2, "seconds_per_fold": 34.2},
+    {"copies": 2, "seconds": 41.9, "seconds_per_fold": 20.95},
+    {"copies": 4, "seconds": 64.3, "seconds_per_fold": 16.08},
+    {"copies": 8, "seconds": 87.4, "seconds_per_fold": 10.93}
+  ],
+  "fit": {
+    "model": "seconds = fixed + per_fold * copies",
+    "fixed_seconds": 28.2,
+    "per_fold_seconds": 7.66,
+    "r_squared": 0.977,
+    "note": "Four points is a small fit and the residual at copies=4 is 5.4 s, so treat these as the right order of magnitude rather than as precise constants. The qualitative result -- a fixed cost several times the marginal cost of one fold -- is not sensitive to that."
+  },
+  "predicted_efficiency_8_devices": {
+    "comment": "From the fit above, not measured. speedup = t(K,1)/t(K,N) with t(K,N) = fixed + per_fold*K/N. A ceiling: it ignores host memory, PCIe and filesystem contention, which only reduce it.",
+    "16": 0.43,
+    "32": 0.58,
+    "64": 0.72,
+    "128": 0.84,
+    "256": 0.91,
+    "868": 0.97
+  },
+  "what_this_does_not_measure": [
+    "More than one device. There is one card here; every multi-device number on this page is a prediction derived from single-card measurements, and is labelled as such.",
+    "Two-chain complexes. These are single chains, which are smaller and faster per fold than a real binder-target assembly.",
+    "Context-parallel folding of one oversized complex, which no installed engine supports."
+  ]
+}

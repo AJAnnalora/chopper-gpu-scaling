@@ -1,5 +1,7 @@
 # Multi-GPU device policy — test code
 
+
+
 This repository holds the parts of a protein-design pipeline that decide how the hardware gets
 used: how many GPUs a run may use, how the work is split across them, what command line that
 produces, and how jobs take turns on a machine so they never collide. Two modules and their
@@ -32,9 +34,14 @@ Requires Python 3 and nothing else — no `pip install`, no GPU, no network.
 python3 selftest.py
 ```
 
-Both modules' suites, around fifty assertions. They simulate a 1-GPU box and an 8-GPU box,
-and they simulate crashed and competing jobs, checking the behavior that actually matters when
-an allocation is on the line.
+Both modules' suites. They simulate a 1-GPU box, an 8-GPU box and a partial cluster
+allocation, and they simulate crashed and competing jobs, checking the behavior that actually
+matters when an allocation is on the line.
+
+The same suite runs on every push to this repository, on Python 3.10, 3.12 and 3.13, on a
+clean machine with **no GPU at all** — see `.github/workflows/selftest.yml`. There is no
+install step in it, which is the point: if a dependency ever creeps in, the badge above turns
+red and the "nothing to install" claim stops being a promise and starts being enforced.
 
 Then see a multi-GPU run resolved on whatever machine you are sitting at:
 
@@ -57,7 +64,7 @@ And what this machine reports for itself:
 python3 scripts/gpu_devices.py --show
 ```
 
-## The four decisions worth checking
+## The five decisions worth checking
 
 **It refuses rather than silently downgrades.** Requesting 8 devices and *executing* with one
 visible is refused outright, naming both numbers. It does not quietly run at 1 and report
@@ -73,6 +80,15 @@ in both places.
 
 **An undetermined device count is refused, not guessed.** If the GPU count cannot be
 established, a multi-device request fails rather than assuming a number.
+
+**The scheduler's allocation beats the machine's inventory.** On a shared cluster node the
+GPUs in the box are not the GPUs you were given: granted two of eight, Slurm sets
+`CUDA_VISIBLE_DEVICES=3,5` while `nvidia-smi` goes on truthfully reporting eight. Asking the
+hardware therefore gets the wrong answer in the only place it matters — a `devices=8` request
+would pass the gate and the run would reach for six cards belonging to another job. So the
+scheduler's variable is read first, and the hardware only when there is no allocation to
+respect. This was a real bug, found while writing the batch scripts in `slurm/`, and it is one
+a single-GPU workstation cannot surface: a one-card box has no subset to be given.
 
 **Unsupported paths are marked unsupported.** The capability map records, per engine, whether
 a split mode works:
@@ -93,14 +109,21 @@ scaling factor, this repository ships the thing that measures one:
 
 ```bash
 python3 scripts/scaling_benchmark.py --dry-run          # what it would run. No GPU, no install
-python3 scripts/scaling_benchmark.py --devices 1,2,4,8 --copies 16
+python3 scripts/scaling_benchmark.py --devices 1,2,4,8
 ```
 
 The real run needs [Boltz](https://github.com/jwohlwend/boltz) — the open folding engine this
-pipeline drives — and that many visible GPUs. It folds 16 independent copies of a public
-sequence (GFP, UniProt P42212, one substitution apart so none is a cache hit), shards them
-across the devices, and prints wall-clock, speedup against the single-device run, and parallel
+pipeline drives — and that many visible GPUs. It folds independent copies of a public sequence
+(GFP, UniProt P42212, one substitution apart so none is a cache hit), shards them across the
+devices, and prints wall-clock, speedup against the single-device run, and parallel
 efficiency. Results are written to `scaling.json`.
+
+**Batch size is not a free parameter, so it defaults to 16 folds per device.** Every device
+pays the fixed startup cost separately, which means a small batch measures that cost rather
+than the sharding — 16 folds total across 8 devices predicts 43% efficiency, and 16 *per
+device* predicts 84%. Both numbers would be true. Pass a smaller `--copies` deliberately and it
+says so before it starts; the measured basis for all of this is in
+[`results/`](results/README.md).
 
 It is **offline**: the inputs declare an empty alignment, so nothing is sent to an MSA server.
 That keeps network variance out of a timing measurement and keeps the sequences on the machine.
@@ -122,9 +145,10 @@ about context-parallel folding of one oversized complex, which no installed engi
 
 So a good number here means the sharding works. It does not mean a campaign runs this fast.
 
-If efficiency falls below roughly 60% at 8 devices, per-device fixed costs — model load, input
-parsing — are dominating, and the answer is a larger batch rather than more cards. That is the
-number we would most like to know and cannot currently produce.
+What counts as low efficiency depends on the batch, so rather than a rule of thumb there is a
+measured cost model in [`results/`](results/README.md) and a prediction for the batch you ran
+printed alongside the result. Landing near the prediction means the sharding works. Landing far
+below it is the finding, and the one we would most like to hear about.
 
 ---
 
@@ -211,29 +235,81 @@ table says `UNSUPPORTED` until it is done and measured.
 Stating this plainly is the point of publishing the map at all. A pipeline whose capability
 table lists only successes is a table that tells a reader nothing.
 
-### A measured baseline
+### A measured baseline, and what it predicts
 
-On the single RTX 3090, one two-chain complex at 5 poses — fold, score and report — takes
-**1 min 52 s** wall clock at 5.6 GB peak memory. That is about 22 s per pose end to end.
-A larger campaign on the same hardware measured **523 poses/hour**, or ~7 s per pose: the
-difference is the per-run fixed cost, which is paid once and amortizes over a panel. Both
-numbers are from this hardware; neither is a projection.
+The benchmark has been run here, on the one card, and its output is committed in
+[`results/`](results/README.md) rather than described. Folding *K* independent copies on one
+RTX 3090:
 
-The first thing worth measuring on real multi-GPU hardware is therefore scaling efficiency at
-2, 4 and 8 devices on one fixed panel — which would also be the first chance to find out
-whether the near-linear expectation above survives contact with a real node.
+| folds | wall clock | per fold |
+|---|---|---|
+| 1 | 34.2 s | 34.2 s |
+| 2 | 41.9 s | 21.0 s |
+| 4 | 64.3 s | 16.1 s |
+| 8 | 87.4 s | 10.9 s |
+
+A straight line fits those four points at R² = 0.98: **28.2 s of fixed cost per run, plus
+7.7 s per fold.** The fixed part is about four times the marginal cost of one fold, and it is
+paid once however many folds follow it.
+
+That one ratio decides the whole multi-GPU question here, because sharding a batch makes
+*every* device pay the 28.2 s separately. From `t(K,N) = 28.2 + 7.7·K/N`:
+
+| panel size | predicted efficiency at 8 devices |
+|---|---|
+| 32 | 58% |
+| 128 | 84% |
+| 256 | 91% |
+| 868 | 97% |
+
+**Those are predictions from single-card measurements, and they are a ceiling** — they ignore
+contention for host memory, PCIe and the filesystem, all of which push the real number down.
+They are published because they are falsifiable: run the benchmark on eight real cards and the
+table is either approximately right or it is wrong.
+
+The honest shape of the answer is therefore conditional, and both halves are worth stating.
+**Small panels do not justify multiple cards.** At 32 candidates, most of the gain is consumed
+by eight copies of a 28-second startup, and anyone who benchmarks this with a small batch will
+measure poor efficiency and be right to. **The panels this pipeline actually runs are the size
+where it does pay** — hundreds of candidates, the largest to date 868 — which is the regime the
+request is about.
+
+A second measurement, from the full pipeline including scoring and reporting rather than bare
+folds, points the same way: one two-chain complex at 5 poses takes **1 min 52 s** at 5.6 GB
+peak (≈22 s per pose), while the 868-candidate campaign sustained **523 poses/hour** (≈7 s per
+pose) on the same card. Same conclusion by a different route.
+
+## Running it on a cluster
+
+`slurm/` holds two batch scripts: `scaling.sbatch`, which produces the 1/2/4/8-device table
+above from one submission, and `campaign.sbatch`, the production shape. **Neither has been
+submitted to a real scheduler** — there is no cluster here — and `slurm/README.md` says so at
+the top, marks the lines that need editing per site, and explains the one part that is not
+boilerplate: the device count appears once, in the loadfile, and a disagreement between it and
+`--gres` is refused with both numbers named rather than silently resolved.
 
 ## Files
 
 ```
-scripts/gpu_devices.py      the whole device-policy surface: @GPU parsing, the capability
-                            map, resolution, the plan/execute gate, and the engine argv
-scripts/chopper_launch.py   the job lock and queue: one job at a time, enforced
-scripts/scaling_benchmark.py  measure real speedup across N GPUs. --dry-run needs neither
-example_8gpu.loadfile.txt   a declaration asking for 8 devices. Device policy only --
-                            no target, no sequences
-selftest.py                 runs every test in the repository
-LICENSE                     no license granted; shared for review
+scripts/gpu_devices.py        the whole device-policy surface: @GPU parsing, the capability
+                              map, resolution, the plan/execute gate, the scheduler
+                              allocation, and the engine argv
+scripts/chopper_launch.py     the job lock and queue: one job at a time, enforced
+scripts/scaling_benchmark.py  measure real speedup across N GPUs. --dry-run needs no GPU
+selftest.py                   runs every test in the repository
+example_8gpu.loadfile.txt     a declaration asking for 8 devices. Device policy only --
+                              no target, no sequences
+
+slurm/scaling.sbatch          one submission -> the whole 1/2/4/8-device table. UNTESTED
+slurm/campaign.sbatch         the production shape. Needs the pipeline; UNTESTED
+slurm/README.md               what both do, and the allocation-vs-inventory trap
+
+results/batch_size_curve_rtx3090.json   the measured curve above, and the fit
+results/scaling_rtx3090_1gpu.json       the benchmark's own output on this hardware
+results/README.md             the numbers, the cost model, and what it predicts for 8 GPUs
+
+.github/workflows/selftest.yml  the suite on a clean machine, 3 Python versions, no GPU
+LICENSE                       no license granted; shared for review
 ```
 
 Both modules import only the Python standard library — no array or tensor libraries, no

@@ -38,6 +38,7 @@ CLI:  gpu_devices.py --selftest              # no GPU required
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -107,13 +108,56 @@ def parse_gpu_directive(text):
 
 
 # ====================== DETECT ======================
-def visible_gpu_count():
-    """GPUs this box reports, via nvidia-smi. None when that cannot be determined.
+def allocated_gpu_count():
+    """GPUs THIS PROCESS may use, from the scheduler's own variable. None if it is unset.
 
-    nvidia-smi rather than torch.cuda.device_count() on purpose (SPEC §3b): this must work
-    with no model stack loaded. None is distinct from 0 -- "we could not tell" must never be
-    reported as "there are none".
+    WHY THIS EXISTS, AND WHY IT COMES FIRST. nvidia-smi reports the GPUs PHYSICALLY IN THE
+    BOX. On a shared cluster node those are not the GPUs you were given. SLURM hands you a
+    subset and says so in CUDA_VISIBLE_DEVICES: allocated 2 of 8 means CUDA_VISIBLE_DEVICES=3,5
+    while nvidia-smi still truthfully answers 8.
+
+    Trusting nvidia-smi there defeats the entire gate. `devices=8` would pass the execute
+    check (8 <= 8), the fold engine would be told to use 8, and the run would either crash or
+    reach for cards belonging to another job -- the exact "quietly ran at the wrong device
+    count" failure this module exists to refuse. It cannot be caught on a single-GPU
+    workstation, because a one-card box has no subset to be given.
+
+    An empty string is CUDA's way of saying "no devices", so it means 0 and not "unknown" --
+    the caller must be able to tell a deliberate zero from a failed detection. Entries may be
+    indices or GPU-UUID strings; both are counted the same way. A "-1" entry disables CUDA, so
+    anything that is neither an index nor a UUID is treated as the end of the usable list,
+    which is what CUDA itself does.
     """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "":
+        return 0
+    n = 0
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit() or part.startswith("GPU-") or part.startswith("MIG-"):
+            n += 1
+        else:
+            break          # CUDA stops at the first invalid entry; so do we.
+    return n
+
+
+def visible_gpu_count():
+    """GPUs this process may use. The scheduler's allocation first, else what the box reports.
+
+    None when that cannot be determined. None is distinct from 0 -- "we could not tell" must
+    never be reported as "there are none".
+
+    nvidia-smi rather than torch.cuda.device_count() for the fallback, on purpose (SPEC §3b):
+    this must work with no model stack loaded. But nvidia-smi answers a different question than
+    the one being asked -- see allocated_gpu_count(), which is consulted first precisely
+    because on a shared node the two answers differ and only one of them is ours to use.
+    """
+    allocated = allocated_gpu_count()
+    if allocated is not None:
+        return allocated
     if not shutil.which("nvidia-smi"):
         return None
     try:
@@ -176,11 +220,22 @@ def validate_gpu_request(engine, devices, split, *, visible=None, executing=True
                 "(nvidia-smi absent or failed). Refusing to start a multi-device fold "
                 "blind. Run with --dry-run to see the plan." % devices)
         if devices > visible:
+            # Name WHERE the number came from. "only 2 visible" is baffling on a node with
+            # eight cards in it until you know the scheduler is being quoted, and that is
+            # exactly the case where the message has to be self-explanatory -- the reader is
+            # looking at a failed cluster job and `nvidia-smi` saying eight.
+            if allocated_gpu_count() is not None:
+                src = ("allocated to this job by the scheduler; CUDA_VISIBLE_DEVICES=%s"
+                       % os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+                how = ("Ask the scheduler for %d (e.g. --gres=gpu:%d), or lower devices to "
+                       "match the allocation." % (devices, devices))
+            else:
+                src = "present on this box, per nvidia-smi"
+                how = "Lower devices, or run on hardware that has them."
             raise SystemExit(
-                "@GPU devices=%d but only %d GPU%s visible (nvidia-smi). "
-                "Lower devices, or run on hardware that has them. "
-                "--dry-run will plan for %d on this box without refusing."
-                % (devices, visible, " is" if visible == 1 else "s are", devices))
+                "@GPU devices=%d but only %d GPU%s %s. %s "
+                "--dry-run will plan for %d anywhere without refusing."
+                % (devices, visible, " is" if visible == 1 else "s are", src, how, devices))
 
 
 # ====================== RESOLVE ======================
@@ -320,6 +375,46 @@ def selftest():
        refuses(lambda: validate_gpu_request("af2", 4, "batch", visible=8)))
     ck("af2 at devices=1 still passes -- today's path is untouched",
        validate_gpu_request("af2", 1, "batch", visible=1) is None)
+
+    # The scheduler's allocation, not the box's inventory. These are the cluster cases, and
+    # they are the ones a single-GPU workstation can never produce by accident: nvidia-smi is
+    # right about the hardware and wrong about what this job was given.
+    _saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "3,5"
+        ck("a 2-GPU SLURM allocation on an 8-GPU node reports 2, not 8",
+           visible_gpu_count() == 2)
+        ck("...so devices=8 in that allocation is REFUSED rather than stealing cards",
+           refuses(lambda: validate_gpu_request("boltz", 8, "batch",
+                                                visible=visible_gpu_count())))
+        try:
+            validate_gpu_request("boltz", 8, "batch", visible=visible_gpu_count())
+            msg = ""
+        except SystemExit as e:
+            msg = str(e)
+        # The refusal has to say WHERE the count came from, or it reads as nonsense next to an
+        # nvidia-smi that is reporting eight cards on the same node.
+        ck("...and the refusal blames the scheduler, not nvidia-smi",
+           "scheduler" in msg and "CUDA_VISIBLE_DEVICES=3,5" in msg and "nvidia-smi" not in msg)
+        ck("...and says how to fix it from the submission side",
+           "--gres=gpu:8" in msg)
+        ck("...and devices=2, which is what was actually granted, passes",
+           validate_gpu_request("boltz", 2, "batch", visible=visible_gpu_count()) is None)
+        os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-aaaa1111,GPU-bbbb2222,GPU-cccc3333"
+        ck("a UUID allocation is counted, not mistaken for zero", visible_gpu_count() == 3)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        ck("an empty allocation is 0 -- a deliberate zero, distinct from undetermined",
+           visible_gpu_count() == 0)
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+        ck("the CUDA disable idiom -1 yields 0 usable devices", visible_gpu_count() == 0)
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+        ck("unset falls back to the box's own count, which is how a workstation behaves",
+           visible_gpu_count() == allocated_gpu_count() or allocated_gpu_count() is None)
+    finally:
+        if _saved is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _saved
 
     ck("EXECUTING: devices=8 on a 1-GPU box is REFUSED",
        refuses(lambda: validate_gpu_request("boltz", 8, "batch", visible=1)))

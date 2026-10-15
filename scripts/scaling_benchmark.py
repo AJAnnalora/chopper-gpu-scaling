@@ -28,16 +28,25 @@ USAGE
         Print exactly what would run, at each device count. No GPU, no Boltz, no network.
         Start here: it is also how you check what this will do before letting it near a node.
 
-    python3 scripts/scaling_benchmark.py --devices 1,2,4,8 --copies 16
+    python3 scripts/scaling_benchmark.py --devices 1,2,4,8
         The real thing. Needs Boltz installed and that many visible GPUs. Prints wall-clock,
-        speedup against the 1-device run, and parallel efficiency.
+        speedup against the 1-device run, and parallel efficiency. The batch size defaults to
+        16 folds per device, which is large enough that the fixed startup cost each device pays
+        does not dominate the result -- pass --copies to override, and read the note on
+        PER_DEVICE_DEFAULT before choosing something small.
 
     python3 scripts/scaling_benchmark.py --devices 1 --copies 2 --samples 1
         A cheap smoke test that the invocation works at all before spending a node on it.
 
-Reading the output: efficiency is speedup divided by device count. Below about 60% at 8
-devices, the fixed costs per device -- model load, input parsing -- are dominating, and the
-answer is a larger batch rather than more cards. That is the number worth reporting back.
+Reading the output: efficiency is speedup divided by device count. Low efficiency at a high
+device count means the per-device fixed costs -- model load, input parsing -- are dominating,
+and the answer is a larger batch rather than more cards.
+
+HOW LOW IS TOO LOW depends on the batch, and results/README.md gives the measured prediction
+instead of a rule of thumb: on this hardware a fold batch is 28.2 s of fixed cost plus 7.7 s
+per fold, which puts 8 devices at roughly 84% efficiency for 16 folds per device and roughly
+43% for 2. A result far BELOW the prediction for the batch actually used is the interesting
+outcome, and the one worth reporting back.
 """
 import argparse
 import json
@@ -55,6 +64,18 @@ import gpu_devices as gd          # noqa: E402  -- the module under test builds 
 
 BOLTZ_ENV = os.environ.get("BOLTZ_ENV", "boltz2")
 
+#: Folds per device when --copies is not given. NOT an arbitrary round number: on the one card
+#: available here a fold batch costs 28.2 s of fixed setup plus 7.7 s per fold (measured, four
+#: batch sizes, R^2 = 0.98 -- results/batch_size_curve_rtx3090.json). Sharding only pays once
+#: the per-device work is large against that 28.2 s, because every device pays it separately.
+#:
+#: At 16 folds TOTAL across 8 devices each device does 2 folds, pays 28.2 s to do 15 s of work,
+#: and the measurement reports about 43% efficiency -- a true number about a badly chosen batch,
+#: which a reader would reasonably mistake for a statement about the sharding. 16 folds PER
+#: DEVICE predicts about 84%. So the default scales with the device count instead of being
+#: fixed, and the hostile case is reachable on purpose with an explicit small --copies.
+PER_DEVICE_DEFAULT = 16
+
 # Public. GFP, UniProt P42212, the sequence every structural biology course uses. It is here
 # so this script needs no input file and leaks nothing: a reviewer can verify the sequence
 # against UniProt in a browser.
@@ -63,6 +84,30 @@ GFP = ("MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTFSYGVQCFS
        "IKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITHGMDELYK")
 
 SUBS = "ACDEFGHIKLMNPQRSTVWY"
+
+
+#: Fitted on this box: four batch sizes (1, 2, 4, 8 folds) on one RTX 3090, R^2 = 0.98.
+#: results/batch_size_curve_rtx3090.json holds the raw numbers.
+FIXED_S, PER_FOLD_S = 28.2, 7.7
+
+
+def predicted_efficiency(copies, devices):
+    """What the single-card cost model expects, so a real result has something to be compared to.
+
+    Batch sharding gives each device copies/devices folds, and EVERY device pays the fixed cost
+    -- that is the whole of the model and the whole reason small batches scale badly:
+
+        t(K, N) = FIXED + PER_FOLD * K/N          speedup = t(K,1) / t(K,N)
+
+    It ignores contention for host memory bandwidth, PCIe and the filesystem, all of which push
+    the real number DOWN. So treat it as a ceiling rather than a target: landing near it means
+    sharding is working, and landing far below it is the finding worth chasing.
+    """
+    if devices <= 1 or copies <= 0:
+        return 1.0
+    t1 = FIXED_S + PER_FOLD_S * copies
+    tn = FIXED_S + PER_FOLD_S * (copies / float(devices))
+    return (t1 / tn) / devices
 
 
 def variants(k):
@@ -110,10 +155,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--devices", default="1,2,4,8",
                     help="comma-separated device counts to time (default 1,2,4,8)")
-    ap.add_argument("--copies", type=int, default=16,
-                    help="independent folds in the batch (default 16). Keep it a multiple of "
-                         "the largest device count, or the last device idles and efficiency "
-                         "reads low for the wrong reason.")
+    ap.add_argument("--copies", type=int, default=None,
+                    help="independent folds in the batch. Default is %d x the largest device "
+                         "count, so every device gets a full share and the fixed startup cost "
+                         "is amortized rather than measured. A small batch makes any sharding "
+                         "look bad -- see results/README.md, which has the measured numbers."
+                         % PER_DEVICE_DEFAULT)
     ap.add_argument("--samples", type=int, default=1,
                     help="diffusion samples per fold (default 1 -- this is a timing run)")
     ap.add_argument("--out", default="bench_out", help="working directory")
@@ -122,12 +169,30 @@ def main():
     a = ap.parse_args()
 
     counts = [int(x) for x in a.devices.split(",") if x.strip()]
+    if not counts:
+        print("--devices was empty; nothing to time.")
+        return 2
     out = Path(a.out).resolve()
     visible = gd.visible_gpu_count()
 
+    if a.copies is None:
+        a.copies = PER_DEVICE_DEFAULT * max(counts)
+        derived = "  (%d per device x %d devices -- see PER_DEVICE_DEFAULT)" % (
+            PER_DEVICE_DEFAULT, max(counts))
+    else:
+        derived = ""
+        per_dev = a.copies / float(max(counts))
+        if per_dev < 8:
+            # Say it BEFORE the run rather than leaving a low number to be misread after it.
+            print("NOTE: %d folds across %d devices is %.1f folds per device. Each device pays "
+                  "the fixed\n      startup cost once, so a batch this small reports low "
+                  "efficiency about the BATCH,\n      not about the sharding. Drop --copies to "
+                  "let it scale with the device count."
+                  % (a.copies, max(counts), per_dev))
+
     print("=" * 78)
-    print("  FOLD BATCH SCALING -- %d independent folds, %d diffusion sample(s)"
-          % (a.copies, a.samples))
+    print("  FOLD BATCH SCALING -- %d independent folds, %d diffusion sample(s)%s"
+          % (a.copies, a.samples, derived))
     print("  visible GPUs: %s" % ("undetermined" if visible is None else visible))
     print("=" * 78)
 
@@ -187,9 +252,17 @@ def main():
     print("  %d folds, %d sample(s) each. Efficiency is speedup / devices." % (a.copies, a.samples))
     print("  Low efficiency at high device counts means per-device fixed costs dominate;")
     print("  the answer to that is a bigger batch, not more cards.")
+    for n in counts:
+        if n > 1:
+            print("  predicted at %d devices, this batch: %.0f%%  (28.2s fixed + 7.7s/fold, "
+                  "measured on 1 card)" % (n, 100.0 * predicted_efficiency(a.copies, n)))
 
     (out / "scaling.json").write_text(json.dumps(
-        {"copies": a.copies, "samples": a.samples, "visible_gpus": visible, "rows": rows},
+        {"copies": a.copies, "samples": a.samples, "visible_gpus": visible,
+         "folds_per_device": {str(n): round(a.copies / float(n), 2) for n in counts},
+         "predicted_efficiency": {str(n): round(predicted_efficiency(a.copies, n), 3)
+                                  for n in counts},
+         "rows": rows},
         indent=2))
     print("  wrote %s" % (out / "scaling.json"))
     return 0

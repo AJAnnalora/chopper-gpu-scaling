@@ -1,0 +1,101 @@
+# Proof the tests pass on a machine that is not the author's.
+#
+# This repository exists so that a claim about hardware can be CHECKED. It would be a strange
+# repository if checking it required trusting the laptop it was written on. So every push runs
+# the whole suite on a clean machine that nobody here controls, and the result is on the front
+# page before anyone clones anything.
+#
+# THERE IS NO INSTALL STEP. That is the headline rather than an omission. Both modules import
+# only the Python standard library -- no torch, no numpy, no pipeline code -- so a bare
+# interpreter is the entire environment. The day a dependency creeps in, this file turns red,
+# which makes the "nothing to install" claim in README.md self-enforcing instead of a promise.
+#
+# NO GPU HERE EITHER, and this is the stronger version of the demonstration: these runners have
+# ZERO GPUs, where the development box has one. Everything under test either simulates a device
+# count or resolves honestly against whatever is present, so zero is just another input. A test
+# suite for a GPU request that needs a GPU to run is a test suite a reviewer cannot use.
+#
+# LINUX ONLY, deliberately. The launcher reads /proc to tell a dead process from a zombie,
+# which is a Linux interface, and the hardware this is written for is a Linux cluster. macOS and
+# Windows are not claimed and so are not tested; pretending otherwise would be the same sin as
+# claiming multi-GPU results.
+#
+# The Python versions below are the ones actually run by hand before being listed here.
+
+name: selftest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: nothing to install
+        run: |
+          python3 -c "import sys; print(sys.version)"
+          echo "no pip install, no requirements file, no lockfile -- standard library only"
+
+      - name: every test in the repository
+        run: python3 selftest.py
+
+      # The plan path, on a machine with no GPU at all. This is the claim from README.md --
+      # "an 8-device request resolves and prints honestly on a box that does not have them" --
+      # executed here against zero devices rather than described.
+      - name: an 8-GPU request plans correctly on a machine with no GPU
+        run: |
+          python3 scripts/gpu_devices.py --plan example_8gpu.loadfile.txt
+          python3 scripts/gpu_devices.py --show
+
+      # And the refusal, which is the half that protects an allocation. Executing a
+      # multi-device request where the devices do not exist must FAIL. A runner with no GPU is
+      # the cleanest possible place to prove the gate is not decorative.
+      - name: executing that same request without the hardware is refused
+        run: |
+          if python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import gpu_devices as gd
+          gd.validate_gpu_request("boltz", 8, "batch", visible=gd.visible_gpu_count())
+          PY
+          then
+            echo "FAIL: an 8-device execution was allowed on a runner with no GPUs"
+            exit 1
+          else
+            echo "OK: refused, as it must be"
+          fi
+
+      # The scheduler case, which is what a cluster actually does to you: SLURM grants a
+      # SUBSET of a node's cards and says so in CUDA_VISIBLE_DEVICES. Asserted here because it
+      # cannot be reproduced on a single-GPU workstation -- a one-card box has no subset to be
+      # given -- and because getting it wrong means reaching for another job's hardware.
+      - name: a partial scheduler allocation is respected, not the node's inventory
+        run: |
+          CUDA_VISIBLE_DEVICES=3,5 python3 - <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import gpu_devices as gd
+          n = gd.visible_gpu_count()
+          assert n == 2, "expected 2 allocated devices, got %r" % n
+          try:
+              gd.validate_gpu_request("boltz", 8, "batch", visible=n)
+          except SystemExit:
+              print("OK: asked for 8 while granted 2 -> refused")
+          else:
+              raise AssertionError("asked for 8 while granted 2 and it was ALLOWED")
+          gd.validate_gpu_request("boltz", 2, "batch", visible=n)
+          print("OK: asked for the 2 that were granted -> allowed")
+          PY
